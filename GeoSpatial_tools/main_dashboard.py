@@ -6,6 +6,7 @@ from gps_heatmapper.app import gps_heatmapper
 from pollution_visualizer.app import pollution_visualizer
 from crop_monitoring.app import crop_monitor
 from satellite_detection.app import satellite_detector
+from flood_detection.app import flood_detector, flood_predictor
 from utils.visualization import show_about
 
 # ============= PAGE CONFIGURATION & THEME =============
@@ -72,6 +73,7 @@ tool = st.sidebar.radio(
         "🌫️ Pollution Visualizer",
         "🌾 Crop Monitoring",
         "🛰️ Object Detection",
+        "🌊 Flood Analysis",
         "ℹ️ About"
     ],
     index=0,
@@ -108,6 +110,16 @@ elif tool.startswith("🌾"):
 elif tool.startswith("🛰️"):
     st.markdown("<div class='tool-header'>Object Detection</div>", unsafe_allow_html=True)
     satellite_detector(st.session_state.get("uploaded_files", {}))
+elif tool.startswith("🌊"):
+    st.markdown("<div class='tool-header'>Flood Analysis</div>", unsafe_allow_html=True)
+
+    uploaded_files = st.session_state.get("uploaded_files", {})
+
+    tab1, tab2 = st.tabs(["🌊 Flood Detection", "📈 Flood Prediction"])
+    with tab1:
+        flood_detector(uploaded_files)
+    with tab2:
+        flood_predictor(uploaded_files)
 elif tool.startswith("ℹ️"):
     st.markdown("<div class='tool-header'>About This Project</div>", unsafe_allow_html=True)
     show_about()
