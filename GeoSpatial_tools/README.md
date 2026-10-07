@@ -4,13 +4,14 @@ A comprehensive toolkit for analyzing satellite and geospatial data with AI capa
 
 ## Features
 
-- **Data Uploader**: Drag-and-drop interface for various geospatial file formats
+- **Data library**: Drag-and-drop upload for GeoTIFF, imagery, CSV and vector files
 - **NDVI Viewer**: Visualize and analyze vegetation indices
 - **Land Use Classifier**: Classify satellite imagery into urban, forest, water, etc.
 - **GPS Heatmapper**: Create interactive heatmaps from GPS data
 - **Pollution Visualizer**: Analyze NO₂ and other pollution data
 - **Crop Monitoring**: Track vegetation health over time
 - **Satellite Object Detection**: Detect objects in satellite imagery using YOLO
+- **Georeference**: Pin an image to the map with ground control points and export a georeferenced GeoTIFF
 
 ## Installation
 
@@ -20,18 +21,17 @@ A comprehensive toolkit for analyzing satellite and geospatial data with AI capa
    - Windows: `venv\Scripts\activate`
    - Mac/Linux: `source venv/bin/activate`
 4. Install dependencies: `pip install -r requirements.txt`
-5. Run the app: `streamlit run main_dashboard.py`
-6. Run the tests: `pytest test_core.py`
+5. Run the app: `uvicorn server:app --port 8599`, then open http://localhost:8599
+6. Run the tests: `pytest test_core.py test_api.py`
+
+The backend is FastAPI (`server.py`); the frontend is plain HTML/CSS/JS in `frontend/` with no build step.
+Uploaded files are kept in server memory and cleared on restart.
 
 Models: object detection uses the bundled COCO `yolov8n.pt`. The DeepLab land-use option
 appears only if `landuse_classifier/deeplabv3_finetuned_RS_openearthmap_v2.pth` exists.
 
-Rasters in projected CRSs (e.g. Sentinel-2 UTM) are reprojected to lat/lon for map overlays.
-NDVI and land-use results can be downloaded as GeoTIFFs that keep the source georeferencing.
+## Security
 
-## Usage
-
-1. Start by uploading your data using the Data Uploader
-2. Navigate to the appropriate tool for your analysis
-3. All tools will automatically detect relevant files from your uploads
-4. Adjust parameters as needed and view results
+The server has no login. By default `uvicorn` listens on localhost only; don't pass
+`--host 0.0.0.0` on an untrusted network. Uploads are capped at 1 GB
+(`GEOAI_MAX_UPLOAD_MB` to change).

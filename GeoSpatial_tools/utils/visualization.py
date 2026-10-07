@@ -1,50 +1,9 @@
-import streamlit as st
-import folium
-import xyzservices.providers as xyz
-from streamlit_folium import st_folium
-import matplotlib.pyplot as plt
+import base64
+import io
+
 import numpy as np
-
-def page_header(title, subtitle):
-    """Consistent title + one-line description at the top of every tool."""
-    st.title(title)
-    st.caption(subtitle)
-    st.divider()
-
-
-def empty_state(message):
-    """Friendly prompt shown when a tool has no matching uploads."""
-    st.info(f"{message} Add files in **Data Uploader** (sidebar).", icon=":material/upload_file:")
-
-
-def plot_ndvi(ndvi_array, title="NDVI Map"):
-    """Plot NDVI array"""
-    fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(ndvi_array, cmap='RdYlGn', vmin=-1, vmax=1)
-    plt.colorbar(im, ax=ax, label='NDVI Value')
-    ax.set_title(title)
-    ax.axis('off')
-    st.pyplot(fig)
-    plt.close(fig)
-
-BASEMAPS = {  # all key-free (CartoDB tiles now require an API key)
-    "Light Gray": xyz.Esri.WorldGrayCanvas,
-    "OpenStreetMap": xyz.OpenStreetMap.Mapnik,
-    "Satellite": xyz.Esri.WorldImagery,
-}
-
-
-def add_basemaps(m):
-    """Add switchable basemaps (first is the default) and a layer control to a folium map."""
-    for name, provider in BASEMAPS.items():
-        folium.TileLayer(provider, name=name).add_to(m)
-    folium.LayerControl().add_to(m)
-    return m
-
-
-def display_map(folium_map, width=None, height=500):
-    """Render a folium map full-width (or at a fixed width) without round-tripping map events."""
-    st_folium(folium_map, width=width, height=height, use_container_width=width is None, returned_objects=[])
+from matplotlib import colormaps
+from PIL import Image
 
 
 def prepare_for_display(img_array):
@@ -56,3 +15,30 @@ def prepare_for_display(img_array):
     elif np.issubdtype(src.dtype, np.floating) or arr.min() < 0 or arr.max() > 255:
         arr = (arr - arr.min()) / (np.ptp(arr) + 1e-8) * 255
     return np.clip(np.round(arr), 0, 255).astype(np.uint8)
+
+
+def colorize(values, cmap, vmin, vmax):
+    """Map a 2D float array to RGBA uint8 with a matplotlib colormap; NaN becomes transparent."""
+    norm = np.clip((values - vmin) / (vmax - vmin + 1e-12), 0, 1)
+    rgba = (colormaps[cmap](np.nan_to_num(norm)) * 255).astype(np.uint8)
+    rgba[np.isnan(values), 3] = 0
+    return rgba
+
+
+def png_bytes(image):
+    """Encode a PIL image or uint8 array as PNG bytes."""
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def png_data_url(image, max_size=1600):
+    """PNG data URL for display, downscaled so the longer side is at most max_size."""
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)
+    if max(image.size) > max_size:
+        image = image.copy()
+        image.thumbnail((max_size, max_size), Image.LANCZOS)
+    return "data:image/png;base64," + base64.b64encode(png_bytes(image)).decode()

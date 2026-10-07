@@ -78,7 +78,7 @@ def _rgba_tif():
 
 
 def test_landuse_ignores_alpha_band():
-    from landuse_classifier.app import load_image_for_classification, classify_by_clustering
+    from landuse_classifier.classifier import load_image_for_classification, classify_by_clustering
     img, has_nir, _, _, mask = load_image_for_classification(_rgba_tif())
     assert img.shape == (10, 10, 3) and not has_nir     # alpha is not NIR
     assert not mask[:, :5].any() and mask[:, 5:].all()  # alpha 0 -> no data
