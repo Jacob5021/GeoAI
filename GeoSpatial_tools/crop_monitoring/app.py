@@ -1,4 +1,5 @@
 import streamlit as st
+from utils.visualization import page_header, empty_state
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,43 +8,16 @@ from PIL import Image
 import rasterio
 
 from ndvi_viewer.ndvi_processor import (
+    calculate_ndvi_from_file,
     get_satellite_bands,
     SATELLITE_PROFILES
 )
 
 # -----------------------------
-# NDVI Calculation with masking
-# -----------------------------
-def calculate_ndvi_from_file(file, red_band, nir_band):
-    """Read GeoTIFF bands and calculate NDVI, masking nodata pixels."""
-    with rasterio.open(file) as src:
-        red = src.read(red_band).astype(float)
-        nir = src.read(nir_band).astype(float)
-
-        # Handle nodata
-        nodata = src.nodata
-        if nodata is not None:
-            mask = (red == nodata) | (nir == nodata)
-        else:
-            mask = (red == 0) & (nir == 0)  # fallback for blank areas
-
-        ndvi = (nir - red) / (nir + red + 1e-10)
-        ndvi[mask] = np.nan  # exclude invalid pixels
-
-    return ndvi
-
-# -----------------------------
 # Main App
 # -----------------------------
 def crop_monitor(uploaded_files):
-    st.header("🌾 Smart Crop Monitoring")
-    st.markdown("""
-    Monitor crop health through:
-
-    - NDVI time series analysis **or**
-    - Direct NDVI calculation from satellite images
-
-    """)
+    page_header("Crop Monitoring", "Track crop health with NDVI time series, from a CSV or computed from imagery.")
 
     # Initialize session state for time series data
     if 'ndvi_data' not in st.session_state:
@@ -71,7 +45,7 @@ def crop_monitor(uploaded_files):
 def process_csv_data(uploaded_files):
     """Process uploaded CSV time series"""
     if 'csv' not in uploaded_files:
-        st.warning("No CSV files found. Switch to image mode or upload files.")
+        empty_state("No NDVI CSV yet (or switch to image mode).")
         return
 
     selected_file = st.selectbox("Select CSV file", [f.name for f in uploaded_files['csv']])
@@ -108,25 +82,25 @@ def process_csv_data(uploaded_files):
 def process_image_data(uploaded_files):
     """Process uploaded satellite images to calculate NDVI"""
     image_files = []
-    for ext in ['tif','tiff','geotiff','jpg','png']:
+    for ext in ['tif','tiff','geotiff','jpg','jpeg','png']:
         image_files.extend(uploaded_files.get(ext, []))
 
     if not image_files:
-        st.warning("No image files found. Please upload satellite images.")
+        empty_state("No imagery yet.")
         return
 
     selected_file = st.selectbox("Select image", [f.name for f in image_files])
     file = next(f for f in image_files if f.name == selected_file)
 
     # Detect if file is a GeoTIFF or RGB
-    try:
+    # GDAL opens PNG/JPG too, so decide by extension
+    is_geotiff = file.name.lower().endswith(('.tif', '.tiff', '.geotiff'))
+    if is_geotiff:
         with rasterio.open(file) as src:
             total_bands = src.count
-            is_geotiff = True
-    except Exception:
+    else:
         img = np.array(Image.open(file))
         total_bands = img.shape[-1] if img.ndim == 3 else 1
-        is_geotiff = False
 
     # Satellite selection including Image proxy option
     sat_options = list(SATELLITE_PROFILES.keys()) + ["Image (RGB with proxy NIR)"]
@@ -135,7 +109,8 @@ def process_image_data(uploaded_files):
     satellite = st.selectbox(
         "Satellite/Sensor",
         options=sat_options,
-        index=default_index
+        index=default_index,
+        key=f"crop_sat_{selected_file}"  # re-default when the file changes
     )
 
     # Band selection
@@ -148,14 +123,14 @@ def process_image_data(uploaded_files):
             red_band = st.number_input(
                 "Red band index",
                 min_value=1,
-                value=bands['red'],
+                value=bands['red'] or 3,
                 help=f"Default for {satellite}: Band {bands['red']}"
             )
         with col2:
             nir_band = st.number_input(
                 "NIR band index",
                 min_value=1,
-                value=bands['nir'],
+                value=bands['nir'] or 4,
                 help=f"Default for {satellite}: Band {bands['nir']}"
             )
 
@@ -208,7 +183,7 @@ def visualize_time_series():
     df = st.session_state.ndvi_data.copy()
     df = df.sort_values('date')
     df['ndvi'] = pd.to_numeric(df['ndvi'], errors='coerce')
-    df = df.dropna(subset=['ndvi'])
+    df = df.dropna(subset=['ndvi']).groupby('date', as_index=False)['ndvi'].mean()
 
     # Analysis parameters
     col1, col2 = st.columns(2)
@@ -250,6 +225,7 @@ def visualize_time_series():
     ax.legend()
     ax.grid(True)
     st.pyplot(fig)
+    plt.close(fig)
 
     # Stress detection using smoothed NDVI if available
     stress_col = 'ndvi_smooth' if 'ndvi_smooth' in df.columns else 'ndvi'

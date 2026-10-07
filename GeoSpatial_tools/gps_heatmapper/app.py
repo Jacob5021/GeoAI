@@ -1,4 +1,5 @@
 import streamlit as st
+from utils.visualization import page_header, empty_state
 import pandas as pd
 from .map_utils import create_heatmap, validate_gps_data, create_drawable_map, get_drawn_features
 from utils.visualization import display_map
@@ -8,8 +9,7 @@ from shapely.geometry import Point
 
 
 def gps_heatmapper(uploaded_files):
-    st.header("🔥 GPS Heatmapper")
-    st.markdown("Create heatmaps from uploaded CSV or by drawing points directly on a map")
+    page_header("GPS Heatmapper", "Heatmaps from uploaded GPS points or points you draw on the map.")
 
     if 'drawn_points' not in st.session_state:
         st.session_state.drawn_points = pd.DataFrame(columns=['lat', 'lon', 'weight'])
@@ -29,7 +29,7 @@ def gps_heatmapper(uploaded_files):
 
 def handle_csv_upload(uploaded_files):
     if 'csv' not in uploaded_files:
-        st.warning("No CSV files uploaded")
+        empty_state("No CSV files yet.")
         return
 
     selected_file = st.selectbox("Select CSV file", [f.name for f in uploaded_files['csv']])
@@ -92,7 +92,7 @@ def handle_map_drawing():
         edited_points = st.data_editor(
             st.session_state.drawn_points,
             num_rows="dynamic",
-            use_container_width=True
+            width="stretch"
         )
         st.session_state.drawn_points = edited_points
 
@@ -109,7 +109,7 @@ def handle_map_drawing():
                                 radius=radius,
                                 blur=blur,
                                 weight_col='weight')
-            st_folium(hm, width=700, height=500)
+            display_map(hm)
 
         st.subheader("Export Data")
         col1, col2 = st.columns(2)

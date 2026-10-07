@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#1B6CA8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F6FB"
+textColor = "#14263D"
+font = "sans serif"
+
+[server]
+maxUploadSize = 1000  # MB; satellite scenes are large
+
+[client]
+toolbarMode = "viewer"  # hide developer Deploy button

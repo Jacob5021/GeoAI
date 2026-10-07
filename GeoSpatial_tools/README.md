@@ -21,6 +21,13 @@ A comprehensive toolkit for analyzing satellite and geospatial data with AI capa
    - Mac/Linux: `source venv/bin/activate`
 4. Install dependencies: `pip install -r requirements.txt`
 5. Run the app: `streamlit run main_dashboard.py`
+6. Run the tests: `pytest test_core.py`
+
+Models: object detection uses the bundled COCO `yolov8n.pt`. The DeepLab land-use option
+appears only if `landuse_classifier/deeplabv3_finetuned_RS_openearthmap_v2.pth` exists.
+
+Rasters in projected CRSs (e.g. Sentinel-2 UTM) are reprojected to lat/lon for map overlays.
+NDVI and land-use results can be downloaded as GeoTIFFs that keep the source georeferencing.
 
 ## Usage
 

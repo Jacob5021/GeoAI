@@ -1,4 +1,5 @@
 import streamlit as st
+from utils.visualization import page_header, empty_state
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -8,6 +9,8 @@ import torch
 import torchvision.transforms as T
 import pandas as pd
 import cv2
+from utils.visualization import prepare_for_display
+from utils.geospatial_utils import to_geotiff_bytes
 
 # ================== CLASS LABELS & COLORS ==================
 LAND_USE_CLASSES = {
@@ -34,38 +37,22 @@ CLASS_COLORS = {
     8: [178, 34, 34]     # Building - Firebrick Red
 }
 
-# ================== SAFE DISPLAY UTILITY ==================
-def prepare_for_display(img_array):
-    """Ensure image is safe for display in Streamlit: uint8 [0–255]."""
-    arr = img_array.copy()
-
-    # Case 1: float images
-    if np.issubdtype(arr.dtype, np.floating):
-        if arr.min() < 0 or arr.max() > 1.0:
-            arr = (arr - arr.min()) / (np.ptp(arr) + 1e-8)   # np.ptp for NumPy ≥2.0
-        arr = (arr * 255).astype(np.uint8)
-
-    # Case 2: integer images
-    elif np.issubdtype(arr.dtype, np.integer):
-        if arr.max() > 255:
-            arr = (255 * (arr - arr.min()) / (np.ptp(arr) + 1e-8)).astype(np.uint8)
-        else:
-            arr = arr.astype(np.uint8)
-
-    return arr
+# Distinct colours for unlabelled k-means clusters (1..10)
+CLUSTER_COLORS = [[31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40], [148, 103, 189],
+                  [140, 86, 75], [227, 119, 194], [127, 127, 127], [188, 189, 34], [23, 190, 207]]
 
 # ================== LOAD DEEPLABV3+ MODEL ==================
 from torchvision.models.segmentation import deeplabv3_resnet50   
+deeplab_model = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @st.cache_resource
 def load_deeplab_model():
     num_classes = 9
     model = deeplabv3_resnet50(num_classes=num_classes, aux_loss=False, output_stride=16)
-    weights_path = "D:\GeoSpatial_tools\landuse_classifier\deeplabv3_finetuned_RS_openearthmap_v2.pth"
+    weights_path = os.path.join(os.path.dirname(__file__), "deeplabv3_finetuned_RS_openearthmap_v2.pth")
 
     if not os.path.exists(weights_path):
-        st.error(f"Model weights file not found at {os.path.abspath(weights_path)}")
         return None
 
     try:
@@ -79,25 +66,18 @@ def load_deeplab_model():
         st.error(f"Error loading model: {str(e)}")
         return None
 
-deeplab_model = load_deeplab_model()
-
 # ================== MAIN APP ==================
 def landuse_classifier(uploaded_files):
-    st.header("🏞️ Land Use Classification")
-
-    st.markdown("""
-    Classify land use types in satellite imagery using:
-    - NDVI-based classification
-    - Spectral clustering
-    - DeepLabV3+ (pretrained ML model)
-    """)
+    page_header("Land Use Classifier", "Classify imagery into water, vegetation, agriculture, built-up and bare land.")
+    global deeplab_model
+    deeplab_model = load_deeplab_model()
 
     image_files = []
     for ext in ['tif', 'tiff', 'geotiff', 'jpg', 'jpeg', 'png']:
         image_files.extend(uploaded_files.get(ext, []))
 
     if not image_files:
-        st.warning("Please upload satellite images first")
+        empty_state("No imagery yet.")
         return
 
     selected_file = st.selectbox("Select image for classification", [f.name for f in image_files])
@@ -106,6 +86,8 @@ def landuse_classifier(uploaded_files):
     method_options = ["Simple NDVI-based", "Spectral Clustering"]
     if deeplab_model is not None:
         method_options.append("DeepLabV3+ (ML Model)")
+    else:
+        st.caption("DeepLabV3+ is available once `deeplabv3_finetuned_RS_openearthmap_v2.pth` is placed in `landuse_classifier/`.")
 
     method = st.radio("Choose classification approach:", method_options)
 
@@ -124,14 +106,24 @@ def landuse_classifier(uploaded_files):
                 img_array, has_nir, red_band, nir_band, mask = load_image_for_classification(file)
 
                 if method == "Simple NDVI-based":
+                    if not has_nir:
+                        st.warning("No NIR band found: NDVI is approximated from the red and green channels, "
+                                   "so classes are rough. Spectral Clustering suits RGB/grayscale imagery better.")
                     classified = classify_by_ndvi(img_array, ndvi_threshold_water, ndvi_threshold_vegetation,
                                                   has_nir, red_band, nir_band, mask)
                 elif method == "Spectral Clustering":
                     classified = classify_by_clustering(img_array, n_clusters, mask)
+                    # k-means clusters are unlabelled: don't dress them up as land-use classes
+                    names = {0: "No data", **{k: f"Cluster {k}" for k in range(1, n_clusters + 1)}}
+                    colors = {0: [0, 0, 0], **{k: CLUSTER_COLORS[(k - 1) % len(CLUSTER_COLORS)]
+                                               for k in range(1, n_clusters + 1)}}
                 elif method == "DeepLabV3+ (ML Model)":
                     classified = classify_with_deeplab(img_array, mask)
 
-                display_classification_results(img_array, classified, method, overlay)
+                geo_file = file if file.name.lower().endswith(('.tif', '.tiff', '.geotiff')) else None
+                if method != "Spectral Clustering":
+                    names, colors = LAND_USE_CLASSES, CLASS_COLORS
+                display_classification_results(img_array, classified, method, overlay, geo_file, names, colors)
 
         except Exception as e:
             st.error(f"Classification failed: {str(e)}")
@@ -144,25 +136,25 @@ def load_image_for_classification(file):
     try:
         if file.name.lower().endswith(('.tif', '.tiff', '.geotiff')):
             import rasterio
+            from rasterio.enums import ColorInterp
             with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
                 tmp_file.write(file.getvalue())
                 tmp_path = tmp_file.name
             try:
                 with rasterio.open(tmp_path) as src:
-                    img_array = src.read()  # (C, H, W)
+                    # Alpha bands are masks, not spectral data (RGBA exports are common)
+                    data_bands = [i + 1 for i, c in enumerate(src.colorinterp) if c != ColorInterp.alpha]
+                    img_array = src.read(data_bands)  # (C, H, W)
                     img_array = np.transpose(img_array, (1, 2, 0))  # (H, W, C)
 
-                    # --- Get valid-data mask ---
-                    if src.nodata is not None:
-                        mask = src.read_masks(1) > 0   # True = valid, False = nodata
-                    else:
-                        mask = np.ones((src.height, src.width), dtype=bool)
+                    # Valid-data mask from nodata, alpha band or internal mask
+                    mask = src.dataset_mask() > 0
 
                     # Store NIR if available
-                    if src.count >= 4:
+                    if len(data_bands) >= 4:
                         has_nir = True
-                        red_band = src.read(3).astype(float)
-                        nir_band = src.read(4).astype(float)
+                        red_band = src.read(data_bands[2]).astype(float)
+                        nir_band = src.read(data_bands[3]).astype(float)
 
                     # --- Fix channels for display ---
                     if img_array.shape[2] == 1:  # grayscale
@@ -235,8 +227,8 @@ def classify_by_clustering(img_array, n_clusters, mask=None):
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     kmeans.fit(valid_pixels[sample_idx])
 
-    cluster_labels = np.zeros(len(pixels), dtype=int)
-    cluster_labels[mask_flat] = kmeans.predict(valid_pixels)
+    cluster_labels = np.zeros(len(pixels), dtype=int)  # 0 = no data
+    cluster_labels[mask_flat] = kmeans.predict(valid_pixels) + 1
 
     return cluster_labels.reshape(h, w)
 
@@ -267,28 +259,29 @@ def classify_with_deeplab(img_array, mask=None):
     return prediction
 
 # ================== DISPLAY ==================
-def display_classification_results(original_img, classified, method, overlay=True):
-    colored_classified = create_colored_classification_map(classified)
+def display_classification_results(original_img, classified, method, overlay=True, geo_file=None,
+                                   names=LAND_USE_CLASSES, colors=CLASS_COLORS):
+    colored_classified = create_colored_classification_map(classified, colors)
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Original Image")
-        st.image(prepare_for_display(original_img), caption="Input satellite image", use_container_width=True)
+        st.image(prepare_for_display(original_img), caption="Input satellite image", width="stretch")
 
     with col2:
         st.subheader("Land Use Classification")
         if overlay:
             orig_255 = prepare_for_display(original_img)
             overlay_img = cv2.addWeighted(orig_255, 0.6, colored_classified, 0.4, 0)
-            st.image(overlay_img, caption=f"{method} (Overlay)", use_container_width=True)
+            st.image(overlay_img, caption=f"{method} (Overlay)", width="stretch")
         else:
-            st.image(colored_classified, caption=f"{method}", use_container_width=True)
+            st.image(colored_classified, caption=f"{method}", width="stretch")
 
     unique_classes, counts = np.unique(classified, return_counts=True)
     total_pixels = classified.size
     stats_data = []
     for class_id, count in zip(unique_classes, counts):
-        class_name = LAND_USE_CLASSES.get(class_id, f"Class {class_id}")
+        class_name = names.get(class_id, f"Class {class_id}")
         percentage = (count / total_pixels) * 100
         stats_data.append({
             'Land Use Type': class_name,
@@ -296,14 +289,14 @@ def display_classification_results(original_img, classified, method, overlay=Tru
             'Percentage': percentage
         })
     stats_df = pd.DataFrame(stats_data)
-    st.dataframe(stats_df.style.format({"Percentage": "{:.2f}%"}), use_container_width=True)
+    st.dataframe(stats_df.style.format({"Percentage": "{:.2f}%"}), width="stretch")
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    class_names = [LAND_USE_CLASSES.get(cls, f"Class {cls}") for cls in unique_classes]
+    class_names = [names.get(cls, f"Class {cls}") for cls in unique_classes]
     percentages = [(count / total_pixels) * 100 for count in counts]
     bars = ax.bar(class_names, percentages)
     for bar, class_id in zip(bars, unique_classes):
-        bar.set_color(np.array(CLASS_COLORS.get(class_id, [128, 128, 128])) / 255.0)
+        bar.set_color(np.array(colors.get(class_id, [128, 128, 128])) / 255.0)
     ax.set_ylabel("Percentage of Area")
     ax.set_title("Land Use Distribution")
     plt.xticks(rotation=45, ha='right')
@@ -318,13 +311,17 @@ def display_classification_results(original_img, classified, method, overlay=Tru
         classified_img.save(buf, format='PNG')
         st.download_button("Download Classification Map", buf.getvalue(),
                            file_name="land_use_classification.png", mime="image/png")
+        if geo_file is not None:
+            st.download_button("Download Classification GeoTIFF (class IDs)",
+                               to_geotiff_bytes(classified.astype(np.uint8), geo_file),
+                               file_name="land_use_classification.tif", mime="image/tiff")
         csv = stats_df.to_csv(index=False)
         st.download_button("Download Statistics", data=csv,
                            file_name="land_use_statistics.csv", mime="text/csv")
 
-def create_colored_classification_map(classified):
+def create_colored_classification_map(classified, colors=CLASS_COLORS):
     h, w = classified.shape
     colored_map = np.zeros((h, w, 3), dtype=np.uint8)
-    for class_id, color in CLASS_COLORS.items():
+    for class_id, color in colors.items():
         colored_map[classified == class_id] = color
     return colored_map

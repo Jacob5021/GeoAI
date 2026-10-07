@@ -1,23 +1,19 @@
 import streamlit as st
+from utils.visualization import page_header, empty_state
 import pandas as pd
 import numpy as np
 import folium
 import rasterio
 from folium.plugins import HeatMap
-from streamlit_folium import folium_static
-from utils.geospatial_utils import validate_pollution_data
+from utils.geospatial_utils import validate_pollution_data, read_band_wgs84
+from utils.visualization import add_basemaps, display_map
 import matplotlib.pyplot as plt
 from io import BytesIO
 import geopandas as gpd
 from folium.features import GeoJsonTooltip
 
 def pollution_visualizer(uploaded_files):
-    st.header("🌫️ Pollution Visualizer")
-    st.markdown("""
-    Visualize atmospheric pollution data from:
-    - CSV files (point measurements)
-    - GeoTIFF files (raster data from satellites)
-    """)
+    page_header("Pollution Visualizer", "Map NO₂, PM2.5 and other pollutants from station CSVs or satellite rasters.")
     
     # File selection with type filtering
     available_files = []
@@ -25,7 +21,7 @@ def pollution_visualizer(uploaded_files):
         available_files.extend(uploaded_files.get(ext, []))
     
     if not available_files:
-        st.warning("Please upload CSV or GeoTIFF files with pollution data")
+        empty_state("No pollution CSV or GeoTIFF yet.")
         return
     
     selected_file = st.selectbox("Select data file", [f.name for f in available_files])
@@ -72,7 +68,7 @@ def process_csv_file(file):
             max_value=max_val,
             value=(min_val, max_val)
         )
-        df = df[(df[pollution_col] >= threshold[0]) & (df[pollution_col] <= threshold[1])]
+        df = df[(df[pollution_col] >= threshold[0]) & (df[pollution_col] <= threshold[1])].copy()
         
         # Validate data
         validation = validate_pollution_data(df, lat_col, lon_col, pollution_col)
@@ -91,8 +87,9 @@ def process_csv_file(file):
         m = folium.Map(
             location=[df[lat_col].mean(), df[lon_col].mean()],
             zoom_start=10,
-            tiles="CartoDB dark_matter"
+            tiles=None
         )
+        add_basemaps(m)
         
         # Add heatmap
         HeatMap(
@@ -142,7 +139,7 @@ def process_csv_file(file):
                 except Exception as e:
                     st.error(f"Failed to load boundary file: {str(e)}")
         
-        folium_static(m, width=700, height=500)
+        display_map(m)
         
         # Statistics
         show_pollution_stats(df, pollution_col)
@@ -156,8 +153,10 @@ def process_geotiff_file(file):
         with st.spinner("Processing satellite data..."):
             with rasterio.open(file) as src:
                 # Read first band (pollution data)
-                data = src.read(1)
-                bounds = src.bounds
+                # Reprojected to lat/lon so the folium overlay lands in the right place
+                data, bounds = read_band_wgs84(src)
+                if src.crs is None:
+                    st.warning("Raster has no CRS; assuming its bounds are lat/lon.")
                 
                 # Try to detect pollutant from metadata
                 pollutant_name = None
@@ -176,7 +175,7 @@ def process_geotiff_file(file):
                     st.warning("Pollutant type not specified. Visualization will proceed without label.")
                 
                 # Create normalized version for visualization
-                norm_data = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data) + 1e-10)
+                norm_data = np.nan_to_num((data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data) + 1e-10))
                 
                 # Threshold filtering
                 min_val, max_val = float(np.nanmin(data)), float(np.nanmax(data))
@@ -195,19 +194,25 @@ def process_geotiff_file(file):
                 ax.set_title(f"{pollutant_name} Concentration Raster" if pollutant_name else "Pollution Concentration Raster")
                 ax.axis('off')
                 st.pyplot(fig)
+                png = BytesIO()
+                fig.savefig(png, format='png')
+                plt.close(fig)
                 
                 # Interactive map
                 st.subheader("Interactive Map")
                 m = folium.Map(
                     location=[(bounds.top + bounds.bottom)/2, (bounds.left + bounds.right)/2],
-                    zoom_start=8
+                    zoom_start=8,
+                    tiles=None
                 )
+                add_basemaps(m)
                 
                 folium.raster_layers.ImageOverlay(
                     image=norm_data.astype(np.float32),
                     bounds=[[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
                     colormap=lambda x: (1, 0, 0, x),  # Red gradient
-                    opacity=0.7
+                    opacity=0.7,
+                    mercator_project=True  # lat/lon grid → web-mercator tiles
                 ).add_to(m)
                 
                 # Add shapefile overlay option
@@ -238,15 +243,13 @@ def process_geotiff_file(file):
                         except Exception as e:
                             st.error(f"Failed to load boundary file: {str(e)}")
                 
-                folium_static(m)
+                display_map(m)
                 
                 # Download options
                 with st.expander("Download Options"):
-                    buf = BytesIO()
-                    plt.savefig(buf, format='png')
                     st.download_button(
                         "Download Visualization",
-                        buf.getvalue(),
+                        png.getvalue(),
                         file_name=f"{pollutant_name or 'pollution_map'}.png",
                         mime="image/png"
                     )
@@ -293,4 +296,5 @@ def show_pollution_stats(df, pollution_col):
     ax.set_xlabel("Concentration")
     ax.set_ylabel("Frequency")
     ax.set_title("Distribution of Pollution Values")
-    st.pyplot(fig)  # Explicitly pass the figure object
+    st.pyplot(fig)
+    plt.close(fig)

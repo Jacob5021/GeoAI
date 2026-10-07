@@ -1,50 +1,27 @@
+import os
 import streamlit as st
+from utils.visualization import page_header, empty_state
 import numpy as np
 from PIL import Image, ImageDraw
 from io import BytesIO
 import cv2
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")  # never pip-install at runtime
 from ultralytics import YOLO
 import tempfile
-import os
 import pandas as pd
 import tifffile
+from utils.visualization import prepare_for_display
 
-# Real classes from a satellite-trained YOLO model
-OBJECT_CLASSES = {
-    0: "Airplane",
-    1: "Ship",
-    2: "Storage Tank",
-    3: "Baseball Diamond",
-    4: "Tennis Court",
-    5: "Vehicle",
-    6: "Building",
-    7: "Road",
-    8: "Bridge",
-    9: "Harbor"
-}
-
-OBJECT_COLORS = {
-    0: (255, 0, 0),    # Red
-    1: (0, 255, 0),    # Green
-    2: (0, 0, 255),    # Blue
-    3: (255, 255, 0),  # Yellow
-    4: (255, 0, 255),  # Magenta
-    5: (0, 255, 255),  # Cyan
-    6: (255, 165, 0),  # Orange
-    7: (128, 0, 128),  # Purple
-    8: (0, 128, 128),  # Teal
-    9: (128, 128, 0)   # Olive
-}
+COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+          (0, 255, 255), (255, 165, 0), (128, 0, 128), (0, 128, 128), (128, 128, 0)]
 
 @st.cache_resource
 def load_model():
-    return YOLO('D:/GeoSpatial_tools/satellite_detection/yolov8n.pt')
+    # ponytail: stock COCO yolov8n; swap in a satellite-trained (e.g. DOTA) model for real aerial classes
+    return YOLO(os.path.join(os.path.dirname(__file__), 'yolov8n.pt'))
 
 def satellite_detector(uploaded_files):
-    st.header("🛰️ Satellite Object Detection")
-    st.markdown("""
-    Detect objects in satellite imagery using YOLO trained on satellite datasets
-    """)
+    page_header("Object Detection", "YOLOv8 object detection on imagery (COCO classes).")
     
     # Check for suitable files
     image_files = []
@@ -52,7 +29,7 @@ def satellite_detector(uploaded_files):
         image_files.extend(uploaded_files.get(ext, []))
     
     if not image_files:
-        st.warning("Please upload satellite images first")
+        empty_state("No imagery yet.")
         return
     
     # File selection
@@ -93,11 +70,13 @@ def satellite_detector(uploaded_files):
                     if arr.ndim == 2:  
                         # Grayscale → replicate 3 times
                         arr = np.stack([arr]*3, axis=-1)
-                    elif arr.ndim == 3 and arr.shape[-1] > 3:
+                    elif arr.ndim == 3:
+                        if arr.shape[0] < arr.shape[-1]:  # (C, H, W) → (H, W, C)
+                            arr = np.moveaxis(arr, 0, -1)
                         # Multispectral → take first 3 bands
-                        arr = arr[..., :3]
+                        arr = arr[..., :3] if arr.shape[-1] >= 3 else np.repeat(arr[..., :1], 3, axis=-1)
 
-                    img = Image.fromarray(arr.astype(np.uint8))
+                    img = Image.fromarray(prepare_for_display(arr))
 
                 # Ensure RGB mode
                 if img.mode != "RGB":
@@ -122,38 +101,35 @@ def satellite_detector(uploaded_files):
                 for result in results:
                     for box in result.boxes:
                         class_id = int(box.cls)
+                        class_name = result.names[class_id]
                         confidence = float(box.conf)
                         bbox = box.xyxy[0].tolist()
                         
                         detections.append({
-                            'class': class_id,
+                            'class_name': class_name,
                             'bbox': bbox,
                             'confidence': confidence
                         })
                         
                         # Draw bounding box
-                        color = OBJECT_COLORS.get(class_id, (255,255,255))
+                        color = COLORS[class_id % len(COLORS)]
                         draw.rectangle(bbox, outline=color, width=3)
                         
                         # Add label
-                        label = f"{OBJECT_CLASSES.get(class_id, 'Unknown')}: {confidence:.2f}"
+                        label = f"{class_name}: {confidence:.2f}"
                         draw.text((bbox[0], bbox[1] - 15), label, fill=color)
                 
                 os.unlink(img_path)  # Clean up temp file
                 
                 # Display results
-                st.image(img, caption=f"Detected {len(detections)} objects", use_column_width=True)
+                st.image(img, caption=f"Detected {len(detections)} objects", width="stretch")
                 
                 # Detection summary
                 st.subheader("Detection Summary")
-                counts = {name: 0 for name in OBJECT_CLASSES.values()}
-                for det in detections:
-                    counts[OBJECT_CLASSES.get(det['class'], "Unknown")] += 1
-                
+                counts = pd.Series([d['class_name'] for d in detections], dtype=object).value_counts()
                 cols = st.columns(4)
                 for i, (name, count) in enumerate(counts.items()):
-                    if count > 0:
-                        cols[i % 4].metric(name, count)
+                    cols[i % 4].metric(name, int(count))
                 
                 # Download options
                 with st.expander("💾 Export Results"):
@@ -170,7 +146,6 @@ def satellite_detector(uploaded_files):
                     # CSV
                     if detections:
                         df = pd.DataFrame(detections)
-                        df['class_name'] = df['class'].map(OBJECT_CLASSES)
                         csv = df[['class_name', 'confidence', 'bbox']].to_csv(index=False)
                         st.download_button(
                             "Download Detection Data",

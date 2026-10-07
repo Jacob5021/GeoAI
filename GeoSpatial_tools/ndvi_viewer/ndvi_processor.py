@@ -1,8 +1,5 @@
 import rasterio
 import numpy as np
-from PIL import Image
-import tempfile
-import os
 
 # Satellite band configurations
 SATELLITE_PROFILES = {
@@ -67,64 +64,28 @@ def get_satellite_bands(satellite):
     """Get band information for selected satellite"""
     return SATELLITE_PROFILES.get(satellite, SATELLITE_PROFILES['Custom'])
 
-def load_bands(file_input, red_idx, nir_idx):
-    """
-    Load bands from image file with validation - handles both file paths and UploadedFile objects
+def load_bands_with_mask(file, red_idx, nir_idx):
+    if hasattr(file, "seek"):
+        file.seek(0)
+    with rasterio.open(file) as src:
+        red = src.read(red_idx).astype(float)
+        nir = src.read(nir_idx).astype(float)
 
-    Args:
-        file_input: File path string or Streamlit UploadedFile object
-        red_idx: 1-based index for red band
-        nir_idx: 1-based index for NIR band
+        # Detect no-data value
+        nodata = src.nodata
+        if nodata is not None:
+            mask = (red == nodata) | (nir == nodata)
+        else:
+            # Fallback: treat pure black pixels as no-data
+            mask = (red == 0) & (nir == 0)
 
-    Returns:
-        tuple: (red_band, nir_band)
-    """
-    # Check if input is a Streamlit UploadedFile object
-    if hasattr(file_input, 'read') and hasattr(file_input, 'name'):
-        # Handle UploadedFile object
-        file_name = file_input.name.lower()
+        # Apply mask
+        red[mask] = np.nan
+        nir[mask] = np.nan
 
-        if file_name.endswith(('.tif', '.tiff', '.geotiff')):
-            # Create temporary file for rasterio
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
-                tmp_file.write(file_input.getvalue())
-                tmp_path = tmp_file.name
+    return red, nir
 
-            try:
-                with rasterio.open(tmp_path) as src:
-                    if red_idx > src.count or nir_idx > src.count:
-                        raise ValueError(f"Band indices must be between 1 and {src.count}")
-                    red_band = src.read(red_idx)
-                    nir_band = src.read(nir_idx)
-            finally:
-                os.unlink(tmp_path)  # Clean up temp file
 
-            return red_band, nir_band
-
-        else:  # For RGB/PNG/JPG
-            img = Image.open(file_input)
-            arr = np.array(img)
-            if len(arr.shape) != 3:
-                raise ValueError("Grayscale images not supported for NDVI")
-            if red_idx-1 >= arr.shape[2] or nir_idx-1 >= arr.shape[2]:
-                raise ValueError(f"Channel indices must be between 1 and {arr.shape[2]}")
-            return arr[:, :, red_idx-1], arr[:, :, nir_idx-1]
-
-    else:
-        # Handle file path string (original logic)
-        if file_input.lower().endswith(('.tif', '.tiff', '.geotiff')):
-            with rasterio.open(file_input) as src:
-                if red_idx > src.count or nir_idx > src.count:
-                    raise ValueError(f"Band indices must be between 1 and {src.count}")
-                return src.read(red_idx), src.read(nir_idx)
-        else:  # For RGB/PNG/JPG
-            img = Image.open(file_input)
-            arr = np.array(img)
-            if len(arr.shape) != 3:
-                raise ValueError("Grayscale images not supported for NDVI")
-            if red_idx-1 >= arr.shape[2] or nir_idx-1 >= arr.shape[2]:
-                raise ValueError(f"Channel indices must be between 1 and {arr.shape[2]}")
-            return arr[:, :, red_idx-1], arr[:, :, nir_idx-1]
 
 def calculate_ndvi(red_band, nir_band):
     """Calculate NDVI with safety checks"""
@@ -141,35 +102,6 @@ def calculate_ndvi(red_band, nir_band):
 
     return np.clip(ndvi, -1, 1)
 
-def calculate_ndvi_from_file(file_input, red_idx: int, nir_idx: int) -> np.ndarray:
-    """
-    Convenience function to calculate NDVI directly from file
-
-    Args:
-        file_input: File path string or UploadedFile object
-        red_idx: 1-based red band index
-        nir_idx: 1-based NIR band index
-
-    Returns:
-        2D NDVI array with same dimensions as input bands
-    """
-    red, nir = load_bands(file_input, red_idx, nir_idx)
-    return calculate_ndvi(red, nir)
-
-def get_mean_ndvi(file_input, red_idx: int, nir_idx: int) -> float:
-    """
-    Calculate mean NDVI for crop monitoring
-
-    Args:
-        file_input: File path string or UploadedFile object
-        red_idx: 1-based red band index
-        nir_idx: 1-based NIR band index
-
-    Returns:
-        Mean NDVI value (NaN if calculation fails)
-    """
-    try:
-        ndvi = calculate_ndvi_from_file(file_input, red_idx, nir_idx)
-        return np.nanmean(ndvi)  # Ignores NaN values
-    except Exception:
-        return np.nan
+def calculate_ndvi_from_file(file, red_idx, nir_idx):
+    """NDVI from a raster, nodata pixels as NaN."""
+    return calculate_ndvi(*load_bands_with_mask(file, red_idx, nir_idx))

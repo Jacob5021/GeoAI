@@ -1,4 +1,5 @@
 import streamlit as st
+from utils.visualization import page_header
 import os
 import pandas as pd
 import rasterio
@@ -30,8 +31,7 @@ def preview_file_metadata(file, file_type):
 
 def data_uploader():
     """Drag-and-drop interface for uploading various geospatial files"""
-    st.header("📤 Data Uploader")
-    st.write("Upload your geospatial data files for analysis across all tools")
+    page_header("Data Uploader", "Upload rasters, imagery, vector and tabular data once; every tool can use it.")
 
     if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = {}
