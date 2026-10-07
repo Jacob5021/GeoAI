@@ -40,6 +40,9 @@ const ICONS = {
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
   pin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',
+  key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
 };
 const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -75,7 +78,8 @@ function rampColor(stops, t) {
 }
 
 /* ================= State ================= */
-const state = { files: [], config: null, charts: [], maps: [], crop: store.get("geoai-crop-points", []) };
+const state = { user: null, files: [], config: null, charts: [], maps: [], crop: [], openResult: null };
+const userKey = (k) => `geoai-${state.user ? state.user.username : "anon"}-${k}`;  // per-account browser storage
 
 async function api(path, body, method) {
   const res = await fetch(path, {
@@ -85,6 +89,7 @@ async function api(path, body, method) {
   });
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (res.status === 401 && !path.startsWith("/api/auth/")) { showAuth(); throw new Error("Please sign in"); }
   if (!res.ok) throw new Error((data && data.detail) || `Request failed (${res.status})`);
   return data;
 }
@@ -105,8 +110,171 @@ async function busy(btn, fn) {
 
 async function refreshFiles() {
   try { state.files = await api("/api/files"); } catch (e) { state.files = []; }
-  const n = state.files.length;
-  $("#files-pill").innerHTML = `${icon("database")}<span><b>${n}</b> file${n === 1 ? "" : "s"} loaded</span>`;
+  const n = state.files.length, r = state.files.reduce((a, f) => a + f.results.length, 0);
+  $("#files-pill").innerHTML = `${icon("database")}<span><b>${n}</b> dataset${n === 1 ? "" : "s"} · <b>${r}</b> result${r === 1 ? "" : "s"}</span>`;
+}
+
+/* ================= Saved results ================= */
+const when = (t) => new Date(t * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+const TOOL_BY_ID = () => Object.fromEntries(TOOLS.map((t) => [t.id, t]));
+
+function resultSummary(r) {
+  const s = r.summary || {}, p = r.params || {};
+  switch (r.tool) {
+    case "ndvi": return `${p.satellite === state.config.rgb_mode ? "RGB proxy" : p.satellite} · mean ${num(s.mean)}`;
+    case "landuse": return `${String(p.method).replace("Simple ", "").replace(" (ML Model)", "")}${p.n_clusters ? ` (${p.n_clusters})` : ""} · ${s.largest}`;
+    case "detect": return `${s.objects} object${s.objects === 1 ? "" : "s"} · conf ${p.conf}`;
+    case "crop": return `${s.date} · NDVI ${num(s.ndvi)}`;
+    case "gps": return `${(s.points || 0).toLocaleString()} points`;
+    case "pollution": return s.pollutant ? `${s.pollutant} · mean ${num(s.mean, 1)}` : `Raster · mean ${num(s.mean, 2)}`;
+    case "georef": return `${s.points} GCPs · RMS ${num(s.rmse_m, 1)} m`;
+    default: return r.tool;
+  }
+}
+
+function savedBar(r) {
+  const res = r.result;
+  if (!res) return "";
+  return res.cached
+    ? `<div class="notice info saved-bar">${icon("database")}<div>Showing the saved result from <b>${when(res.created_at)}</b>. Nothing was recomputed.</div>
+       <button class="btn sm" data-rerun>${icon("refresh")} Re-run</button></div>`
+    : `<div class="notice ok saved-bar">${icon("check")}<div>Saved with <b>${esc(res.file_name)}</b> · ${when(res.created_at)}</div>
+       <a class="btn sm ghost" href="#/data">View in library</a></div>`;
+}
+
+function savedList(toolId, fileId) {
+  const f = fileById(fileId);
+  const rs = ((f && f.results) || []).filter((r) => r.tool === toolId);
+  if (!rs.length) return "";
+  return `<div class="divider"></div><h3 class="section">Saved for this dataset · ${rs.length}</h3><div class="saved-list">
+    ${rs.map((r) => `<a href="#" class="saved-item" data-result="${r.id}"><span>${esc(resultSummary(r))}</span><small>${when(r.created_at)}</small></a>`).join("")}</div>`;
+}
+
+/* Wire a tool's saved-results list, the saved/cached bar and ?result= deep links.
+   show(payload, el) renders a result into el; run(force, btn) performs a run.
+   Tools that draw onto a persistent map pass `bar` (where the saved bar goes) instead of `out`. */
+function wireResults({ view, toolId, fileSel, out, bar, run, show }) {
+  const box = $("#saved-box", view);
+  const drawList = () => { box.innerHTML = savedList(toolId, fileSel.value); };
+  const display = (r) => {
+    state.charts.forEach((c) => c.destroy());
+    state.charts = [];
+    const host = bar || out;
+    if (bar) {
+      bar.innerHTML = savedBar(r);
+      show(r);
+    } else {
+      out.innerHTML = savedBar(r) + `<div class="results" id="out-body"></div>`;
+      show(r, $("#out-body", out));
+    }
+    const b = $("[data-rerun]", host);
+    if (b) b.addEventListener("click", (e) => run(true, e.currentTarget));
+  };
+  const open = async (id) => {
+    const r = await api(`/api/results/${id}`);
+    if (fileSel.value !== r.result.file_id && fileById(r.result.file_id)) {
+      fileSel.value = r.result.file_id;
+      fileSel.dispatchEvent(new Event("change"));
+    }
+    display(r);
+  };
+  box.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-result]");
+    if (!a) return;
+    e.preventDefault();
+    open(a.dataset.result).catch((err) => toast(err.message));
+  });
+  fileSel.addEventListener("change", drawList);
+  drawList();
+  if (state.openResult) { const id = state.openResult; state.openResult = null; open(id).catch((err) => toast(err.message)); }
+  return { display, open, after: async () => { await refreshFiles(); drawList(); } };
+}
+
+/* ================= Accounts ================= */
+function showAuth() {
+  if ($("#auth")) return;
+  state.user = null;
+  $(".app").hidden = true;
+  const el = document.createElement("div");
+  el.id = "auth";
+  el.className = "auth";
+  el.innerHTML = `<div class="auth-card card">
+    <div class="auth-brand"><img src="assets/icon.svg" alt="" width="44" height="44"><div><b>Geo<span>AI</span> Tools</b><small>Earth observation workspace</small></div></div>
+    ${segmented("auth-mode", ["Sign in", "Create account"], "Sign in")}
+    <form id="auth-form">
+      <div class="field"><label for="auth-user">Username</label><input type="text" id="auth-user" autocomplete="username" required minlength="3" maxlength="32"></div>
+      <div class="field"><label for="auth-pass">Password</label><input type="password" id="auth-pass" autocomplete="current-password" required minlength="8"></div>
+      <div class="notice warn" id="auth-err" hidden></div>
+      <button class="btn primary block" type="submit" id="auth-go">Sign in</button>
+    </form>
+    <p class="hint" style="margin:16px 0 0;text-align:center">Your datasets and results are private to your account.</p></div>`;
+  document.body.append(el);
+  let mode = "Sign in";
+  bindSegmented($("#auth-mode", el), (v) => {
+    mode = v;
+    $("#auth-go", el).textContent = v;
+    $("#auth-pass", el).autocomplete = v === "Sign in" ? "current-password" : "new-password";
+  });
+  $("#auth-form", el).addEventListener("submit", (e) => {
+    e.preventDefault();
+    busy($("#auth-go", el), async () => {
+      const body = { username: $("#auth-user", el).value.trim(), password: $("#auth-pass", el).value };
+      try {
+        state.user = await api(mode === "Sign in" ? "/api/auth/login" : "/api/auth/register", body);
+      } catch (err) {
+        const box = $("#auth-err", el);
+        box.hidden = false;
+        box.innerHTML = `${icon("alert")}<div>${esc(err.message)}</div>`;
+        return;
+      }
+      el.remove();
+      $(".app").hidden = false;
+      await startSession();
+    });
+  });
+  $("#auth-user", el).focus();
+}
+
+function modal(html) {
+  const el = document.createElement("div");
+  el.className = "modal";
+  el.innerHTML = `<div class="card card-pad modal-card" role="dialog" aria-modal="true">${html}</div>`;
+  el.addEventListener("click", (e) => { if (e.target === el || e.target.closest("[data-close]")) el.remove(); });
+  document.body.append(el);
+  return el;
+}
+
+function changePassword() {
+  const m = modal(`<h3 style="margin-bottom:16px">Change password</h3><form id="pw-form">
+    <div class="field"><label for="pw-cur">Current password</label><input type="password" id="pw-cur" autocomplete="current-password" required></div>
+    <div class="field"><label for="pw-new">New password</label><input type="password" id="pw-new" autocomplete="new-password" minlength="8" required>
+      <span class="hint">At least 8 characters. Other devices will be signed out.</span></div>
+    <div class="downloads" style="justify-content:flex-end"><button type="button" class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="pw-go" type="submit">Update password</button></div></form>`);
+  $("#pw-form", m).addEventListener("submit", (e) => {
+    e.preventDefault();
+    busy($("#pw-go", m), async () => {
+      await api("/api/auth/password", { current: $("#pw-cur", m).value, new: $("#pw-new", m).value });
+      m.remove();
+      toast("Password updated", "ok");
+    });
+  });
+  $("#pw-cur", m).focus();
+}
+
+function renderUser() {
+  const u = state.user.username;
+  $("#user-box").innerHTML = `<button class="user-pill" id="user-menu" title="Account">
+      <span class="avatar">${esc(u[0].toUpperCase())}</span><span class="uname">${esc(u)}</span></button>
+    <button class="icon-btn" id="pw-btn" title="Change password" aria-label="Change password">${icon("key")}</button>
+    <button class="icon-btn" id="logout-btn" title="Sign out" aria-label="Sign out">${icon("logout")}</button>`;
+  $("#pw-btn").addEventListener("click", changePassword);
+  $("#user-menu").addEventListener("click", changePassword);
+  $("#logout-btn").addEventListener("click", async () => {
+    await api("/api/auth/logout", {});
+    state.files = [];
+    showAuth();
+  });
 }
 const filesOf = (kinds) => state.files.filter((f) => kinds.includes(f.kind));
 const fileById = (id) => state.files.find((f) => f.id === id);
@@ -305,22 +473,39 @@ function renderData(view) {
     const thumb = ["raster", "image"].includes(f.kind)
       ? `<div class="thumb" style="background-image:url('/api/files/${f.id}/thumb')"></div>`
       : `<div class="thumb">${icon(KIND_ICON[f.kind])}</div>`;
-    return `<div class="card file-card">${thumb}<div class="body">
+    const tools = TOOL_BY_ID();
+    const results = f.results.length ? `<div class="result-rows">${f.results.map((r) => {
+      const t = tools[r.tool] || { title: r.tool, icon: "file" };
+      return `<div class="result-row">
+        <span class="r-ico">${icon(t.icon)}</span>
+        <div class="r-main"><b>${esc(t.title)}</b><span>${esc(resultSummary(r))}</span></div>
+        <small class="r-time">${when(r.created_at)}</small>
+        <div class="r-actions">
+          ${r.downloads.map((d) => `<a class="icon-btn" href="${d.url}" download title="${esc(d.label)} · ${fmtBytes(d.size)}" aria-label="Download ${esc(d.label)}">${icon("download")}</a>`).join("")}
+          <a class="btn sm" href="#/${r.tool}?result=${r.id}">Open</a>
+          <button class="icon-btn" data-del-result="${r.id}" title="Delete result" aria-label="Delete result">${icon("x")}</button>
+        </div></div>`;
+    }).join("")}</div>`
+      : `<div class="hint no-results">No results yet. Run ${TOOLS.filter((t) => t.needs.includes(f.kind)).map((t) => `<a href="#/${t.id}">${esc(t.title)}</a>`).join(", ")} on it and the results are stored here.</div>`;
+    return `<div class="card dataset-card">${thumb}<div class="body">
       <div class="top"><span class="name" title="${esc(f.name)}">${esc(f.name)}</span>
-        <button class="icon-btn" data-del="${f.id}" aria-label="Remove ${esc(f.name)}" title="Remove">${icon("trash")}</button></div>
+        <a class="icon-btn" href="/api/files/${f.id}/download" download title="Download original" aria-label="Download ${esc(f.name)}">${icon("download")}</a>
+        <button class="icon-btn" data-del="${f.id}" aria-label="Remove ${esc(f.name)}" title="Delete dataset and its results">${icon("trash")}</button></div>
       <div class="chips"><span class="chip">${KIND_LABEL[f.kind]}</span><span class="chip">${fmtBytes(f.size)}</span>
-        ${chips.filter(Boolean).map((c) => `<span class="chip">${esc(c)}</span>`).join("")}${geo}</div></div></div>`;
+        ${chips.filter(Boolean).map((c) => `<span class="chip">${esc(c)}</span>`).join("")}${geo}
+        <span class="chip">Added ${when(f.created_at)}</span></div>
+      <div class="label" style="margin:14px 0 6px">Results · ${f.results.length}</div>${results}</div></div>`;
   };
   view.innerHTML = `
     <div class="page-head"><div><h1><span class="badge-ico">${icon("database")}</span>Data library</h1>
-      <p>Files stay in this server's memory for the session and are available to every tool.</p></div></div>
+      <p>Your datasets, each with the results computed from it. Everything is saved to your account; reopen any result without running it again.</p></div></div>
     <label class="dropzone" id="drop">
       <input type="file" id="picker" multiple hidden accept=".tif,.tiff,.geotiff,.jpg,.jpeg,.png,.csv,.geojson,.json,.kml,.gpkg,.zip">
       <div class="big">${icon("upload")}</div>
       <h3 id="drop-title">Drop files here or click to browse</h3>
       <p id="drop-sub">GeoTIFF · JPG/PNG · CSV · GeoJSON/KML/GeoPackage · zipped Shapefile</p>
     </label>
-    ${state.files.length ? `<div class="file-grid">${state.files.map(card).join("")}</div>`
+    ${state.files.length ? `<div class="dataset-list">${state.files.map(card).join("")}</div>`
       : `<div class="hint" style="margin-top:14px">No files yet. Satellite scenes up to a few hundred MB work fine.</div>`}`;
 
   const drop = $("#drop", view), picker = $("#picker", view);
@@ -352,7 +537,14 @@ function renderData(view) {
   ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
   drop.addEventListener("drop", (e) => upload(e.dataTransfer.files));
   $$("[data-del]", view).forEach((b) => b.addEventListener("click", async () => {
+    const f = fileById(b.dataset.del);
+    if (f.results.length && !confirm(`Delete ${f.name} and its ${f.results.length} saved result(s)?`)) return;
     await api(`/api/files/${b.dataset.del}`, null, "DELETE");
+    await refreshFiles();
+    renderData(view);
+  }));
+  $$("[data-del-result]", view).forEach((b) => b.addEventListener("click", async () => {
+    await api(`/api/results/${b.dataset.delResult}`, null, "DELETE");
     await refreshFiles();
     renderData(view);
   }));
@@ -366,6 +558,7 @@ function renderNdvi(view, tool) {
       <h3 class="section">Input</h3>${fileSelect("nd-file", tool.needs)}
       <div id="nd-sensor"></div>
       <button class="btn primary block" id="nd-run">${icon("leaf")} Calculate NDVI</button>
+      <div id="saved-box"></div>
     </div>
     <div class="results" id="nd-out">${placeholder("Ready when you are", "Pick a dataset and sensor profile, then calculate NDVI.")}</div></div>`;
   let getSensor;
@@ -377,13 +570,9 @@ function renderNdvi(view, tool) {
   fileSel.addEventListener("change", drawSensor);
   drawSensor();
 
-  $("#nd-run", view).addEventListener("click", (e) => busy(e.currentTarget, async () => {
-    const out = $("#nd-out", view);
-    out.innerHTML = skeleton("Computing NDVI…");
-    const r = await api("/api/ndvi", { file_id: fileSel.value, ...getSensor() }).catch((err) => {
-      out.innerHTML = placeholder("Could not calculate NDVI", err.message, "alert"); throw err;
-    });
-    out.innerHTML = `${notices(r.warnings)}
+  const out = $("#nd-out", view);
+  const show = (r, el) => {
+    el.innerHTML = `${notices(r.warnings)}
       <div class="stats">${statTile("Mean NDVI", num(r.stats.mean))}${statTile("Min", num(r.stats.min))}${statTile("Max", num(r.stats.max))}${statTile("Valid pixels", num(r.stats.valid_pct, 1), "%")}</div>
       <div class="card"><div class="card-head"><div><h3>${esc(r.mode)}</h3><div class="sub">${r.width.toLocaleString()} × ${r.height.toLocaleString()} px</div></div>${downloadsHtml(r.downloads)}</div>
         <div class="figure"><img src="${r.image}" alt="NDVI map"></div>
@@ -396,8 +585,19 @@ function renderNdvi(view, tool) {
             <span>${esc(c.label)} <span class="hint">(${esc(c.range)})</span></span><span class="pct">${num(c.pct, 1)}%</span></div>`).join("")}</div></div></div>
         <div class="card"><div class="card-head"><h3>NDVI distribution</h3></div><div class="chart-box"><canvas id="nd-hist"></canvas></div></div>
       </div>`;
-    histogramChart($("#nd-hist", view), r.histogram, (c) => rampColor(RDYLGN, (c + 1) / 2));
-  }));
+    histogramChart($("#nd-hist", el), r.histogram, (c) => rampColor(RDYLGN, (c + 1) / 2));
+  };
+  let ui;
+  const run = (force, btn) => busy(btn, async () => {
+    out.innerHTML = skeleton("Computing NDVI…");
+    let r;
+    try { r = await api("/api/ndvi", { file_id: fileSel.value, ...getSensor(), force }); }
+    catch (err) { out.innerHTML = placeholder("Could not calculate NDVI", err.message, "alert"); throw err; }
+    ui.display(r);
+    await ui.after();
+  });
+  ui = wireResults({ view, toolId: "ndvi", fileSel, out, run, show });
+  $("#nd-run", view).addEventListener("click", (e) => run(false, e.currentTarget));
 }
 
 /* ---------- Crop monitoring ---------- */
@@ -406,7 +606,7 @@ function renderCrop(view, tool) {
   view.innerHTML = pageHead(tool) + `<div class="tool">
     <div class="panel card card-pad">
       <h3 class="section">Add data</h3>
-      ${segmented("cr-src", ["From CSV", "From imagery"], tables.length || !images.length ? "From CSV" : "From imagery")}
+      ${segmented("cr-src", ["From CSV", "From imagery"], (tables.length || !images.length) && !state.openResult ? "From CSV" : "From imagery")}
       <div id="cr-src-body"></div>
       <div class="divider"></div>
       <h3 class="section">Series <span class="hint" id="cr-count"></span></h3>
@@ -420,7 +620,7 @@ function renderCrop(view, tool) {
     <div class="results" id="cr-out"></div></div>`;
   bindSliders(view);
 
-  const save = () => store.set("geoai-crop-points", state.crop);
+  const save = () => store.set(userKey("crop"), state.crop);
   const body = $("#cr-src-body", view);
   const drawSource = (src) => {
     if (src === "From CSV") {
@@ -445,7 +645,8 @@ function renderCrop(view, tool) {
     } else {
       body.innerHTML = images.length ? `${fileSelect("cr-img", ["raster", "image"], "Image")}<div id="cr-sensor"></div>
         <div class="field"><label for="cr-date-in">Acquisition date</label><input type="date" id="cr-date-in" value="${new Date().toISOString().slice(0, 10)}"></div>
-        <button class="btn primary block" id="cr-add">${icon("plus")} Add mean NDVI to series</button>` : emptyMini("image");
+        <button class="btn primary block" id="cr-add">${icon("plus")} Add mean NDVI to series</button>
+        <div id="cr-bar" style="margin-top:12px"></div><div id="saved-box"></div>` : emptyMini("image");
       if (!images.length) return;
       let getSensor;
       const imgSel = $("#cr-img", body);
@@ -453,12 +654,18 @@ function renderCrop(view, tool) {
       imgSel.addEventListener("change", drawSensor);
       drawSensor();
       const add = $("#cr-add", body);
-      add.addEventListener("click", () => busy(add, async () => {
-        const r = await api("/api/crop/image", { file_id: imgSel.value, date: $("#cr-date-in", body).value, ...getSensor() });
+      const addPoint = (r) => {  // a saved crop result is one dated observation
         state.crop = state.crop.filter((p) => p.date !== r.date).concat([{ date: r.date, ndvi: r.ndvi }]);
         save(); refresh();
-        toast(`${r.date}: mean ${r.mode} ${num(r.ndvi)}`, "ok");
-      }));
+        toast(`${r.date}: mean ${r.mode} ${num(r.ndvi)} added to the series`, "ok");
+      };
+      let ui;
+      const run = (force, btn) => busy(btn, async () => {
+        ui.display(await api("/api/crop/image", { file_id: imgSel.value, date: $("#cr-date-in", body).value, ...getSensor(), force }));
+        await ui.after();
+      });
+      ui = wireResults({ view: body, toolId: "crop", fileSel: imgSel, bar: $("#cr-bar", body), run, show: addPoint });
+      add.addEventListener("click", () => run(false, add));
     }
   };
   const emptyMini = (what) => `<div class="notice info">${icon("info")}<div>No ${what} files yet. <a href="#/data">Upload data</a>.</div></div>`;
@@ -538,6 +745,7 @@ function renderLanduse(view, tool) {
       <div id="lu-params"></div>
       ${methods.length < 3 ? `<p class="hint">DeepLabV3+ appears once <code>deeplabv3_finetuned_RS_openearthmap_v2.pth</code> is in <code>landuse_classifier/</code>.</p>` : ""}
       <button class="btn primary block" id="lu-run">${icon("layers")} Classify land use</button>
+      <div id="saved-box"></div>
     </div>
     <div class="results" id="lu-out">${placeholder("Classify an image", "Clustering works on any imagery; NDVI thresholds need a near-infrared band for meaningful classes.")}</div></div>`;
   let method = "Spectral Clustering";
@@ -552,16 +760,11 @@ function renderLanduse(view, tool) {
   bindSegmented($("#lu-method", view), (v) => { method = Object.keys(label).find((k) => label[k] === v); drawParams(); });
   drawParams();
 
-  $("#lu-run", view).addEventListener("click", (e) => busy(e.currentTarget, async () => {
-    const out = $("#lu-out", view);
-    out.innerHTML = skeleton("Classifying… large scenes take a few seconds");
-    const req = { file_id: $("#lu-file", view).value, method };
-    if ($("#lu-water", view)) Object.assign(req, { water_threshold: +$("#lu-water", view).value, veg_threshold: +$("#lu-veg", view).value });
-    if ($("#lu-k", view)) req.n_clusters = +$("#lu-k", view).value;
-    const r = await api("/api/landuse", req).catch((err) => { out.innerHTML = placeholder("Classification failed", err.message, "alert"); throw err; });
+  const out = $("#lu-out", view), fileSel = $("#lu-file", view);
+  const show = (r, el) => {
     const shown = r.classes.filter((c) => c.pixels > 0);
-    out.innerHTML = `${notices(r.warnings)}
-      <div class="card"><div class="card-head"><div><h3>${esc(method)}</h3><div class="sub">${shown.length} classes</div></div>
+    el.innerHTML = `${notices(r.warnings)}
+      <div class="card"><div class="card-head"><div><h3>${esc(r.method)}</h3><div class="sub">${shown.length} classes</div></div>
         ${segmented("lu-view", ["Overlay", "Classes", "Original"], "Overlay")}</div>
         <div class="figure"><img id="lu-img" src="${r.overlay}" alt="Classification result"></div></div>
       <div class="two">
@@ -571,16 +774,30 @@ function renderLanduse(view, tool) {
         <div class="card"><div class="card-head"><h3>Share of area</h3></div><div class="chart-box"><canvas id="lu-chart"></canvas></div></div>
       </div>
       <div class="card card-pad"><div class="label" style="margin-bottom:10px">Export</div>${downloadsHtml(r.downloads)}</div>`;
-    const seg = $("#lu-view", out);
-    $(".segmented", out).style.margin = "0";
-    bindSegmented(seg, (v) => { $("#lu-img", out).src = v === "Overlay" ? r.overlay : v === "Classes" ? r.classified : r.original; });
-    chart($("#lu-chart", view), {
+    const seg = $("#lu-view", el);
+    seg.style.margin = "0";
+    bindSegmented(seg, (v) => { $("#lu-img", el).src = v === "Overlay" ? r.overlay : v === "Classes" ? r.classified : r.original; });
+    chart($("#lu-chart", el), {
       type: "doughnut",
       data: { labels: shown.map((c) => c.name), datasets: [{ data: shown.map((c) => +c.pct.toFixed(2)), backgroundColor: shown.map((c) => c.color), borderColor: cssVar("--surface"), borderWidth: 2 }] },
       options: { maintainAspectRatio: false, cutout: "62%", plugins: { legend: { position: "right", labels: { usePointStyle: true, boxWidth: 8 } },
         tooltip: { callbacks: { label: (c) => ` ${c.label}: ${c.parsed}%` } } } },
     });
-  }));
+  };
+  let ui;
+  const run = (force, btn) => busy(btn, async () => {
+    out.innerHTML = skeleton("Classifying… large scenes take a few seconds");
+    const req = { file_id: fileSel.value, method, force };
+    if ($("#lu-water", view)) Object.assign(req, { water_threshold: +$("#lu-water", view).value, veg_threshold: +$("#lu-veg", view).value });
+    if ($("#lu-k", view)) req.n_clusters = +$("#lu-k", view).value;
+    let r;
+    try { r = await api("/api/landuse", req); }
+    catch (err) { out.innerHTML = placeholder("Classification failed", err.message, "alert"); throw err; }
+    ui.display(r);
+    await ui.after();
+  });
+  ui = wireResults({ view, toolId: "landuse", fileSel, out, run, show });
+  $("#lu-run", view).addEventListener("click", (e) => run(false, e.currentTarget));
 }
 
 /* ---------- GPS heatmapper ---------- */
@@ -596,7 +813,7 @@ function renderGps(view, tool) {
       ${slider("gp-radius", "Radius", 5, 50, 1, 18, 0)}${slider("gp-blur", "Blur", 5, 50, 1, 15, 0)}
       <label class="check"><input type="checkbox" id="gp-markers"> Show individual points</label>
     </div>
-    <div class="results"><div class="stats" id="gp-stats"></div>
+    <div class="results"><div id="gp-saved-bar"></div><div class="stats" id="gp-stats"></div>
       <div class="card"><div class="card-head"><h3 id="gp-title">Heatmap</h3><div id="gp-actions"></div></div><div class="map" id="gp-map"></div></div></div></div>`;
   bindSliders(view);
   const map = makeMap($("#gp-map", view));
@@ -633,28 +850,40 @@ function renderGps(view, tool) {
   const body = $("#gp-body", view);
   const drawSource = (src) => {
     points = []; render(); setStats(0, 0);
+    $("#gp-saved-bar", view).innerHTML = "";
     if (drawCtl) { map.removeControl(drawCtl); map.removeLayer(drawn); drawCtl = drawn = null; }
     $("#gp-actions", view).innerHTML = "";
     if (src === "From CSV") {
       $("#gp-title", view).textContent = "Heatmap";
       body.innerHTML = tables.length ? `${fileSelect("gp-file", ["table"], "GPS table")}<div id="gp-cols"></div>
-        <button class="btn primary block" id="gp-load">${icon("flame")} Generate heatmap</button>`
+        <button class="btn primary block" id="gp-load">${icon("flame")} Generate heatmap</button><div id="saved-box"></div>`
         : `<div class="notice info">${icon("info")}<div>No CSV files yet. <a href="#/data">Upload data</a> or draw points instead.</div></div>`;
       const load = $("#gp-load", body);
       if (!load) return;
-      $("#gp-file", body).addEventListener("change", () => { $("#gp-cols", body).innerHTML = ""; });
-      load.addEventListener("click", () => busy(load, async () => {
-        const req = { file_id: $("#gp-file", body).value };
-        if ($("#gp-lat", body)) Object.assign(req, { lat_col: $("#gp-lat", body).value, lon_col: $("#gp-lon", body).value, value_col: $("#gp-w", body).value || null });
-        const r = await api("/api/gps", req);
+      const fileSel = $("#gp-file", body);
+      fileSel.addEventListener("change", () => { $("#gp-cols", body).innerHTML = ""; });
+      const pickers = (r) => {
         const opts = (list, sel, none) => (none ? `<option value="">None</option>` : "") + list.map((c) => `<option ${c === sel ? "selected" : ""}>${esc(c)}</option>`).join("");
         $("#gp-cols", body).innerHTML = `<div class="row"><div class="field"><label>Latitude</label><select id="gp-lat">${opts(r.columns, r.lat_col)}</select></div>
           <div class="field"><label>Longitude</label><select id="gp-lon">${opts(r.columns, r.lon_col)}</select></div></div>
           <div class="field"><label>Weight (optional)</label><select id="gp-w">${opts(r.numeric_columns.filter((c) => c !== r.lat_col && c !== r.lon_col), r.value_col, true)}</select></div>`;
-        if (!r.points.length) { toast("Couldn't detect latitude/longitude columns. Pick them and generate again.", "error"); return; }
+      };
+      const show = (r) => {
+        pickers(r);
         points = r.points; render(); setStats(points.length, r.total);
         map.fitBounds(L.latLngBounds(points.map((p) => [p[0], p[1]])), { padding: [30, 30], maxZoom: 15 });
-      }));
+      };
+      let ui;
+      const run = (force, btn) => busy(btn, async () => {
+        const req = { file_id: fileSel.value, force };
+        if ($("#gp-lat", body)) Object.assign(req, { lat_col: $("#gp-lat", body).value, lon_col: $("#gp-lon", body).value, value_col: $("#gp-w", body).value || null });
+        const r = await api("/api/gps", req);
+        if (!r.points.length) { pickers(r); toast("Couldn't detect latitude/longitude columns. Pick them and generate again."); return; }
+        ui.display(r);
+        await ui.after();
+      });
+      ui = wireResults({ view: body, toolId: "gps", fileSel, bar: $("#gp-saved-bar", view), run, show });
+      load.addEventListener("click", () => run(false, load));
     } else {
       $("#gp-title", view).textContent = "Draw points";
       body.innerHTML = `<div class="notice info">${icon("info")}<div>Use the marker tool on the map to place points. Edit or delete them with the toolbar.</div></div>`;
@@ -686,6 +915,7 @@ function renderPollution(view, tool) {
       <button class="btn primary block" id="po-run">${icon("wind")} Visualize</button>
       <div id="po-live"></div>
       ${boundaryControl()}
+      <div id="saved-box"></div>
     </div>
     <div class="results" id="po-out">${placeholder("Map pollution", "CSV station data becomes a heatmap with markers; rasters are reprojected and draped on the map.", "wind")}</div></div>`;
   let map = null;
@@ -703,20 +933,20 @@ function renderPollution(view, tool) {
     return map;
   };
 
-  const runCsv = async (btn) => {
-    const req = { file_id: fileSel.value };
-    if ($("#po-pol", view)) Object.assign(req, { lat_col: $("#po-lat", view).value, lon_col: $("#po-lon", view).value, value_col: $("#po-pol", view).value });
-    const r = await api("/api/pollution/csv", req);
+  const columnPickers = (r) => {
     const opts = (list, sel) => list.map((c) => `<option ${c === sel ? "selected" : ""}>${esc(c)}</option>`).join("");
     $("#po-opts", view).innerHTML = `<div class="field"><label>Pollutant</label><select id="po-pol">${opts(r.pollutants, r.value_col)}</select></div>
       <div class="row"><div class="field"><label>Latitude</label><select id="po-lat">${opts(r.columns, r.lat_col)}</select></div>
       <div class="field"><label>Longitude</label><select id="po-lon">${opts(r.columns, r.lon_col)}</select></div></div>`;
-    if (!r.points.length) { toast("Pick the latitude, longitude and pollutant columns, then visualize again."); return; }
+  };
+
+  const showCsv = (r, el) => {
+    columnPickers(r);
     const { min, max } = r.stats, digits = max - min < 10 ? 2 : 1;
     live.innerHTML = `<div class="divider"></div><h3 class="section">Filter</h3>
       ${slider("po-lo", "Minimum", min, max, (max - min) / 200 || 1, min, digits)}${slider("po-hi", "Maximum", min, max, (max - min) / 200 || 1, max, digits)}`;
     bindSliders(live);
-    out.innerHTML = `<div class="stats" id="po-stats"></div>${mapCard(`${r.value_col} concentration`)}
+    el.innerHTML = `<div class="stats" id="po-stats"></div>${mapCard(`${r.value_col} concentration`)}
       <div class="card"><div class="card-head"><h3>Distribution</h3></div><div class="chart-box"><canvas id="po-hist"></canvas></div></div>`;
     newMap();
     let layers = [];
@@ -741,13 +971,12 @@ function renderPollution(view, tool) {
     histogramChart($("#po-hist", out), r.histogram, (c) => rampColor(INFERNO, (c - min) / ((max - min) || 1)), "Stations");
   };
 
-  const runRaster = async () => {
-    let r = await api("/api/pollution/raster", { file_id: fileSel.value });
+  const showRaster = (r, el) => {
     const [min, max] = r.range, label = r.pollutant || "Concentration", digits = max - min < 10 ? 3 : 1;
     live.innerHTML = `<div class="divider"></div><h3 class="section">Display</h3>
       ${slider("po-op", "Opacity", 0, 1, 0.05, 0.75)}${slider("po-lo", "Minimum", min, max, (max - min) / 200 || 1, min, digits)}${slider("po-hi", "Maximum", min, max, (max - min) / 200 || 1, max, digits)}`;
     bindSliders(live);
-    out.innerHTML = `${notices(r.warnings)}<div class="stats">${statTile("Mean", num(r.stats.mean, digits))}${statTile("Min", num(r.stats.min, digits))}${statTile("Max", num(r.stats.max, digits))}${statTile("Std dev", num(r.stats.std, digits))}</div>
+    el.innerHTML = `${notices(r.warnings)}<div class="stats">${statTile("Mean", num(r.stats.mean, digits))}${statTile("Min", num(r.stats.min, digits))}${statTile("Max", num(r.stats.max, digits))}${statTile("Std dev", num(r.stats.std, digits))}</div>
       ${mapCard(label, downloadsHtml(r.downloads))}
       <div class="card"><div class="card-head"><h3>Value distribution</h3></div><div class="chart-box"><canvas id="po-hist"></canvas></div></div>`;
     newMap();
@@ -759,8 +988,10 @@ function renderPollution(view, tool) {
     const rerange = debounce(async () => {
       const lo = +$("#po-lo", live).value, hi = +$("#po-hi", live).value;
       if (lo >= hi) return;
-      try { r = await api("/api/pollution/raster", { file_id: fileSel.value, vmin: lo, vmax: hi }); } catch (err) { toast(err.message); return; }
-      overlay.setUrl(r.image);
+      let rr;
+      try { rr = await api("/api/pollution/raster", { file_id: r.result ? r.result.file_id : fileSel.value, vmin: lo, vmax: hi }); }
+      catch (err) { toast(err.message); return; }
+      overlay.setUrl(rr.image);
       map.removeControl(legend);
       legend = mapLegend(map, label, INFERNO, lo, hi, digits);
     }, 400);
@@ -768,12 +999,26 @@ function renderPollution(view, tool) {
     $("#po-hi", live).addEventListener("input", rerange);
   };
 
-  $("#po-run", view).addEventListener("click", (e) => busy(e.currentTarget, async () => {
+  const show = (r, el) => (r.type === "raster" ? showRaster(r, el) : showCsv(r, el));
+  let ui;
+  const run = (force, btn) => busy(btn, async () => {
     const f = fileById(fileSel.value);
     out.innerHTML = skeleton(f.kind === "raster" ? "Reprojecting raster…" : "Reading stations…");
-    try { await (f.kind === "raster" ? runRaster() : runCsv()); }
+    const req = { file_id: f.id, force };
+    if (f.kind !== "raster" && $("#po-pol", view)) Object.assign(req, { lat_col: $("#po-lat", view).value, lon_col: $("#po-lon", view).value, value_col: $("#po-pol", view).value });
+    let r;
+    try { r = await api(f.kind === "raster" ? "/api/pollution/raster" : "/api/pollution/csv", req); }
     catch (err) { out.innerHTML = placeholder("Could not visualize this file", err.message, "alert"); throw err; }
-  }));
+    if (r.type === "csv" && !r.points.length) {
+      columnPickers(r);
+      out.innerHTML = placeholder("Choose the columns", "Pick the latitude, longitude and pollutant columns, then visualize again.", "table");
+      return;
+    }
+    ui.display(r);
+    await ui.after();
+  });
+  ui = wireResults({ view, toolId: "pollution", fileSel, out, run, show });
+  $("#po-run", view).addEventListener("click", (e) => run(false, e.currentTarget));
 }
 
 /* ---------- Georeference ---------- */
@@ -788,6 +1033,7 @@ function renderGeoref(view, tool) {
           <button class="btn" type="submit" aria-label="Search">${icon("search")}</button></form></div>
       </div>
       <div class="notice info" id="gr-status"></div>
+      <div id="gr-bar" style="margin-top:12px"></div><div id="saved-box"></div>
     </div>
     <div class="panes">
       <div class="card"><div class="card-head"><h3>1 · Your image</h3><span class="sub">Click a recognisable feature</span></div><div class="map" id="gr-img"></div></div>
@@ -805,7 +1051,7 @@ function renderGeoref(view, tool) {
   state.maps.push(imgMap);
   const imgLayer = L.layerGroup().addTo(imgMap), imgPins = L.layerGroup().addTo(imgMap), worldPins = L.layerGroup().addTo(world);
   let file, sx = 1, sy = 1, gcps = [], residuals = [], fitted = null, overlay = null;
-  const key = () => `geoai-gcps-${file.name}`;
+  const key = () => userKey(`gcps-${file.id}`);
   const complete = () => gcps.filter((g) => g.lat != null && g.lon != null);
   const pending = () => gcps.findIndex((g) => g.lat == null || g.lon == null);
   const pinIcon = (i, wait) => L.divIcon({ className: `gcp-pin${wait ? " pending" : ""}`, html: `<span>${i + 1}</span>`, iconSize: [26, 26], iconAnchor: [13, 13] });
@@ -871,7 +1117,8 @@ function renderGeoref(view, tool) {
     $("#gr-op", view).addEventListener("input", (e) => overlay && overlay.setOpacity(+e.target.value));
     $("#gr-save", view).addEventListener("click", (e) => busy(e.currentTarget, async () => {
       const s = await api("/api/georef", { file_id: file.id, gcps: complete(), save: true });
-      await refreshFiles();
+      $("#gr-bar", view).innerHTML = savedBar(s);
+      await ui.after();
       $("#gr-save-box", view).innerHTML = `${downloadsHtml(s.downloads)}<a class="btn sm" href="#/pollution">${icon("map")} View on map</a><a class="btn sm ghost" href="#/data">Open library</a>`;
       toast(`Saved ${s.file.name} to your library`, "ok");
     }));
@@ -934,6 +1181,9 @@ function renderGeoref(view, tool) {
     } catch (err) { toast("Place search unavailable; pan the map manually"); }
   });
   fileSel.addEventListener("change", loadFile);
+  // Saved georeferences: reopening one restores its control points and refits
+  const ui = wireResults({ view, toolId: "georef", fileSel, bar: $("#gr-bar", view), run: () => $("#gr-save", view)?.click(),
+    show: (r) => { gcps = r.gcps.map((g) => ({ ...g })); changed(); } });
   resultIdle();
   loadFile();
 }
@@ -946,16 +1196,14 @@ function renderDetect(view, tool) {
       <h3 class="section">Input</h3>${fileSelect("de-file", tool.needs, "Image")}
       ${slider("de-conf", "Confidence threshold", 0.05, 0.95, 0.05, 0.25)}${slider("de-iou", "IoU threshold", 0.1, 0.9, 0.05, 0.45)}
       <button class="btn primary block" id="de-run">${icon("scan")} Detect objects</button>
+      <div id="saved-box"></div>
       <p class="hint" style="margin:14px 0 0">Uses the stock YOLOv8n COCO model (vehicles, boats, planes…). A satellite-trained model gives better aerial results.</p>
     </div>
     <div class="results" id="de-out">${placeholder("Find objects", "Run detection to get an annotated image and a table of detections.", "scan")}</div></div>`;
   bindSliders(view);
-  $("#de-run", view).addEventListener("click", (e) => busy(e.currentTarget, async () => {
-    const out = $("#de-out", view);
-    out.innerHTML = skeleton("Running YOLOv8…");
-    const r = await api("/api/detect", { file_id: $("#de-file", view).value, conf: +$("#de-conf", view).value, iou: +$("#de-iou", view).value })
-      .catch((err) => { out.innerHTML = placeholder("Detection failed", err.message, "alert"); throw err; });
-    out.innerHTML = `
+  const out = $("#de-out", view), fileSel = $("#de-file", view);
+  const show = (r, el) => {
+    el.innerHTML = `
       <div class="stats">${statTile("Objects", r.detections.length)}${r.counts.slice(0, 5).map((c) => statTile(c.name, c.count)).join("")}</div>
       ${r.detections.length ? "" : `<div class="notice info">${icon("info")}<div>No objects found at this confidence. Lower the threshold, or use a model trained on aerial imagery.</div></div>`}
       <div class="card"><div class="card-head"><h3>Annotated image</h3>${downloadsHtml(r.downloads)}</div><div class="figure"><img src="${r.image}" alt="Detections"></div></div>
@@ -963,8 +1211,21 @@ function renderDetect(view, tool) {
         <thead><tr><th>Class</th><th>Confidence</th><th>Box (x1, y1, x2, y2)</th></tr></thead><tbody>
         ${r.detections.map((d) => `<tr><td>${esc(d.class_name)}</td><td>${num(d.confidence, 2)}</td><td>${d.bbox.map((v) => Math.round(v)).join(", ")}</td></tr>`).join("")}
         </tbody></table></div></div>` : ""}`;
-  }));
+  };
+  let ui;
+  const run = (force, btn) => busy(btn, async () => {
+    out.innerHTML = skeleton("Running YOLOv8…");
+    let r;
+    try { r = await api("/api/detect", { file_id: fileSel.value, conf: +$("#de-conf", view).value, iou: +$("#de-iou", view).value, force }); }
+    catch (err) { out.innerHTML = placeholder("Detection failed", err.message, "alert"); throw err; }
+    ui.display(r);
+    await ui.after();
+  });
+  ui = wireResults({ view, toolId: "detect", fileSel, out, run, show });
+  $("#de-run", view).addEventListener("click", (e) => run(false, e.currentTarget));
 }
+
+
 
 /* ================= Router & shell ================= */
 const PAGES = { "": renderHome, data: renderData, ndvi: renderNdvi, crop: renderCrop, landuse: renderLanduse, gps: renderGps, pollution: renderPollution, georef: renderGeoref, detect: renderDetect };
@@ -977,7 +1238,8 @@ function renderNav(active) {
 }
 
 async function route() {
-  const id = location.hash.replace(/^#\/?/, "").split("?")[0];
+  const [id, query] = location.hash.replace(/^#\/?/, "").split("?");
+  state.openResult = new URLSearchParams(query || "").get("result");
   const page = PAGES[id] ? id : "";
   state.charts.forEach((c) => c.destroy());
   state.maps.forEach((m) => m.remove());
@@ -1011,8 +1273,15 @@ async function init() {
   $("#menu-btn").addEventListener("click", () => $(".app").classList.add("nav-open"));
   $("#scrim").addEventListener("click", () => $(".app").classList.remove("nav-open"));
   try { state.config = await api("/api/config"); } catch (e) { toast("Cannot reach the GeoAI server. Is it running?"); return; }
+  window.addEventListener("hashchange", () => { if (state.user) route(); });
+  try { state.user = await api("/api/auth/me"); } catch (e) { showAuth(); return; }  // not signed in
+  await startSession();
+}
+
+async function startSession() {
+  state.crop = store.get(userKey("crop"), []);
+  renderUser();
   await refreshFiles();
-  window.addEventListener("hashchange", route);
   route();
 }
 init();

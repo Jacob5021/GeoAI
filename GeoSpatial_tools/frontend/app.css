@@ -139,7 +139,7 @@ button, input, select { font: inherit; color: inherit; }
 .field > label, .label { font-size: 13px; font-weight: 600; color: var(--text); display: flex; justify-content: space-between; gap: 8px; }
 .field .val { font-variant-numeric: tabular-nums; color: var(--primary); font-weight: 600; }
 .hint { font-size: 12.5px; color: var(--muted); }
-select, input[type="number"], input[type="date"], input[type="text"] {
+select, input[type="number"], input[type="date"], input[type="text"], input[type="password"] {
   height: 40px; width: 100%; padding: 0 12px; border-radius: 10px; border: 1px solid var(--border-strong);
   background: var(--surface); transition: border-color .15s, box-shadow .15s;
 }
@@ -222,15 +222,56 @@ input[type="range"] { width: 100%; accent-color: var(--primary); margin: 4px 0; 
 .dropzone .big svg { width: 28px; height: 28px; }
 .dropzone h3 { font-size: 17px; }
 .dropzone p { margin: 0; color: var(--muted); font-size: 13.5px; }
-.file-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); margin-top: 22px; }
-.file-card { overflow: hidden; display: flex; flex-direction: column; }
-.file-card .thumb { aspect-ratio: 16 / 10; background: var(--surface-2) center/cover no-repeat; display: grid; place-items: center; color: var(--faint);
-                    border-bottom: 1px solid var(--border); }
-.file-card .thumb svg { width: 34px; height: 34px; }
-.file-card .body { padding: 12px 14px 14px; display: grid; gap: 8px; }
-.file-card .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.file-card .top { display: flex; align-items: center; gap: 6px; }
-.file-card .top .name { flex: 1; }
+.dataset-list { display: grid; gap: 16px; margin-top: 22px; }
+.dataset-card { display: grid; grid-template-columns: 240px minmax(0, 1fr); overflow: hidden; }
+.dataset-card .thumb { height: 100%; min-height: 170px; background: var(--surface-2) center/cover no-repeat; display: grid;
+                       place-items: center; color: var(--faint); border-right: 1px solid var(--border); }
+.dataset-card .thumb svg { width: 34px; height: 34px; }
+.dataset-card .body { padding: 16px 18px; min-width: 0; }
+.dataset-card .top { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; }
+.dataset-card .name { flex: 1; font-weight: 700; font-size: 15.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 760px) { .dataset-card { grid-template-columns: 1fr; } .dataset-card .thumb { min-height: 150px; border-right: 0; border-bottom: 1px solid var(--border); } }
+.result-rows { display: grid; gap: 6px; }
+.result-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto auto; align-items: center; gap: 10px;
+              padding: 7px 8px 7px 10px; border-radius: 10px; background: var(--surface-2); }
+.result-row .r-ico { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: var(--primary-soft); color: var(--primary); }
+.result-row .r-ico svg { width: 16px; height: 16px; }
+.result-row .r-main { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.result-row .r-main b { white-space: nowrap; font-size: 13.5px; }
+.result-row .r-main span { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.result-row .r-time { color: var(--faint); font-size: 12px; white-space: nowrap; }
+.result-row .r-actions { display: flex; align-items: center; gap: 2px; }
+.result-row .icon-btn { width: 30px; height: 30px; }
+@media (max-width: 760px) { .result-row { grid-template-columns: 30px minmax(0, 1fr); } .result-row .r-time, .result-row .r-actions { grid-column: 2; } }
+.no-results { padding: 10px 12px; border-radius: 10px; background: var(--surface-2); }
+.saved-bar { align-items: center; }
+.saved-bar > div { flex: 1; }
+.saved-list { display: grid; gap: 6px; }
+.saved-item { display: grid; gap: 1px; padding: 8px 10px; border-radius: 9px; background: var(--surface-2); color: var(--text);
+              font-size: 13px; border: 1px solid transparent; }
+.saved-item:hover { border-color: var(--primary); }
+.saved-item small { color: var(--muted); font-size: 11.5px; }
+
+/* ============ Account ============ */
+.foot-row { display: flex; align-items: center; gap: 6px; }
+.sidebar-foot { flex-direction: column; align-items: stretch; gap: 6px; }
+.user-pill { flex: 1; display: flex; align-items: center; gap: 9px; min-width: 0; padding: 6px 8px; border: 0; border-radius: 9px;
+             background: transparent; color: var(--sidebar-text); cursor: pointer; text-align: left; }
+.user-pill:hover { background: var(--sidebar-active); color: #fff; }
+.user-pill .avatar { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; flex: none;
+                     background: linear-gradient(135deg, #1b6ca8, #2ba36b); color: #fff; font-weight: 700; font-size: 13px; }
+.user-pill .uname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; font-size: 13.5px; }
+.auth { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px;
+        background: radial-gradient(900px 500px at 80% -10%, rgba(43, 163, 107, .25), transparent 60%),
+                    radial-gradient(800px 500px at 0% 110%, rgba(27, 108, 168, .35), transparent 60%), var(--bg); }
+.auth-card { width: 100%; max-width: 400px; padding: 30px 28px; box-shadow: var(--shadow-lg); }
+.auth-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+.auth-brand b { display: block; font-size: 21px; font-weight: 800; letter-spacing: -.02em; }
+.auth-brand b span { color: var(--accent); }
+.auth-brand small { color: var(--muted); }
+#auth-err { margin-bottom: 14px; }
+.modal { position: fixed; inset: 0; z-index: 3000; display: grid; place-items: center; padding: 16px; background: rgba(5, 10, 20, .5); }
+.modal-card { width: 100%; max-width: 420px; box-shadow: var(--shadow-lg); }
 
 /* ============ Results ============ */
 .stats { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }

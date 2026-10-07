@@ -1,5 +1,10 @@
-"""End-to-end API checks: upload synthetic files and call every tool endpoint."""
+"""End-to-end API checks: accounts, uploads, every tool endpoint, stored results."""
+import glob
 import io
+import os
+import tempfile
+
+os.environ["GEOAI_DATA_DIR"] = tempfile.mkdtemp(prefix="geoai-test-")  # before importing the app
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -7,9 +12,19 @@ from PIL import Image
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
+import server
+import storage
 from server import app
 
-client = TestClient(app)
+
+def signed_in_client(username, password="correct-horse"):
+    c = TestClient(app)
+    r = c.post("/api/auth/register", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return c
+
+
+client = signed_in_client("alice")
 
 
 def s2_tif():
@@ -46,6 +61,7 @@ def test_tools_end_to_end():
 
     r = client.post("/api/ndvi", json={"file_id": tif["id"], "satellite": "Sentinel-2"}).json()
     assert r["mode"] == "Real NDVI" and len(r["downloads"]) == 2 and abs(sum(c["pct"] for c in r["classes"]) - 100) < 0.01
+    assert r["result"]["cached"] is False
     assert client.get(r["downloads"][1]["url"]).content[:2] in (b"II", b"MM")  # GeoTIFF magic
     r = client.post("/api/ndvi", json={"file_id": img["id"]}).json()
     assert r["mode"] == "Proxy NDVI" and r["warnings"]
@@ -79,7 +95,7 @@ def test_tools_end_to_end():
 
     assert client.delete(f"/api/files/{img['id']}").json()["ok"]
     assert client.post("/api/ndvi", json={"file_id": img["id"]}).status_code == 404
-    assert client.get("/").status_code == 200 and b"GeoAI" in client.get("/").content
+    assert TestClient(app).get("/").status_code == 200 and b"GeoAI" in TestClient(app).get("/").content
 
 
 def test_georeference_recovers_known_transform():
@@ -107,3 +123,91 @@ def test_georeference_recovers_known_transform():
     out = client.get(r["downloads"][0]["url"]).content
     with MemoryFile(out) as mem, mem.open() as src:
         assert src.count == 3 and src.transform.almost_equals(true, precision=1e-6)
+
+
+def test_accounts_required_and_isolated():
+    anon = TestClient(app)
+    assert anon.get("/api/files").status_code == 401
+    assert anon.post("/api/ndvi", json={"file_id": "x"}).status_code == 401
+    assert anon.post("/api/auth/register", json={"username": "a", "password": "longenough"}).status_code == 400
+    assert anon.post("/api/auth/register", json={"username": "alice", "password": "longenough"}).json()["detail"] == "That username is taken"
+    assert anon.post("/api/auth/login", json={"username": "alice", "password": "wrong-pass"}).status_code == 401
+
+    f = upload("mine.png", png())
+    r = client.post("/api/ndvi", json={"file_id": f["id"]}).json()
+    bob = signed_in_client("bob")
+    assert bob.get("/api/files").json() == []
+    assert bob.get(f"/api/files/{f['id']}/thumb").status_code == 404
+    assert bob.post("/api/ndvi", json={"file_id": f["id"]}).status_code == 404
+    assert bob.get(r["downloads"][0]["url"]).status_code == 404
+    assert bob.get(f"/api/results/{r['result']['id']}").status_code == 404
+    assert bob.delete(f"/api/files/{f['id']}").status_code == 404
+
+    bob.post("/api/auth/logout")
+    assert bob.get("/api/files").status_code == 401
+
+
+def test_password_change_and_throttle():
+    c = signed_in_client("carol", "first-password")
+    assert c.post("/api/auth/password", json={"current": "nope-nope", "new": "second-password"}).status_code == 400
+    assert c.post("/api/auth/password", json={"current": "first-password", "new": "second-password"}).status_code == 200
+    assert c.get("/api/auth/me").json()["username"] == "carol"  # this browser stays signed in
+    assert TestClient(app).post("/api/auth/login", json={"username": "carol", "password": "second-password"}).status_code == 200
+    t = TestClient(app)
+    codes = [t.post("/api/auth/login", json={"username": "carol", "password": "bad-password"}).status_code for _ in range(11)]
+    assert codes[:10] == [401] * 10 and codes[10] == 429
+    assert storage.hash_password("x") != storage.hash_password("x")  # salted
+    assert storage.verify_password("x", storage.hash_password("x")) and not storage.verify_password("y", storage.hash_password("x"))
+
+
+def test_results_saved_next_to_dataset_and_reused():
+    f = upload("Field A.tif", s2_tif())
+    first = client.post("/api/ndvi", json={"file_id": f["id"], "satellite": "Sentinel-2"}).json()
+    rid = first["result"]["id"]
+
+    again = client.post("/api/ndvi", json={"file_id": f["id"], "satellite": "Sentinel-2"}).json()
+    assert again["result"]["cached"] is True and again["result"]["id"] == rid and again["stats"] == first["stats"]
+    other = client.post("/api/ndvi", json={"file_id": f["id"], "satellite": "Landsat-8"}).json()  # different settings
+    assert other["result"]["id"] != rid and other["result"]["cached"] is False
+
+    rerun = client.post("/api/ndvi", json={"file_id": f["id"], "satellite": "Sentinel-2", "force": True}).json()
+    assert rerun["result"]["cached"] is False and rerun["result"]["id"] != rid
+    assert client.get(f"/api/results/{rid}").status_code == 404  # replaced, not duplicated
+
+    # Readable folders: data/<user>/<dataset>_<id>/{original, results/ndvi_<time>_<id>/...}
+    folder = glob.glob(os.path.join(storage.DATA_DIR, "alice", f"Field_A_{f['id']}"))[0]
+    assert os.path.exists(os.path.join(folder, "Field_A.tif"))
+    runs = sorted(os.listdir(os.path.join(folder, "results")))
+    assert len(runs) == 2 and all(r.startswith("ndvi_") for r in runs)
+    assert sorted(os.listdir(os.path.join(folder, "results", runs[0]))) == ["ndvi_Field_A.png", "ndvi_Field_A.tif", "result.json"]
+
+    # Library lists results with their dataset
+    listed = next(x for x in client.get("/api/files").json() if x["id"] == f["id"])
+    assert {r["summary"]["mode"] for r in listed["results"]} == {"Real NDVI"} and len(listed["results"]) == 2
+
+    # "Restart": drop every in-memory cache; everything comes back from disk + SQLite
+    for cache in (server.BYTES_CACHE, server.PREVIEW_CACHE, server.RASTER_CACHE):
+        cache.clear()
+    fresh = TestClient(app)
+    fresh.post("/api/auth/login", json={"username": "alice", "password": "correct-horse"})
+    payload = fresh.get(f"/api/results/{rerun['result']['id']}").json()
+    assert payload["stats"] == rerun["stats"] and payload["image"] == rerun["image"]
+    assert fresh.get(payload["downloads"][1]["url"]).content[:2] in (b"II", b"MM")
+    assert fresh.get(f"/api/files/{f['id']}/download").content == s2_tif()
+
+    # Deleting the dataset removes its folder and results
+    assert client.delete(f"/api/files/{f['id']}").json()["ok"]
+    assert not os.path.exists(folder) and client.get(f"/api/results/{rerun['result']['id']}").status_code == 404
+
+
+def test_rename_user_moves_data():
+    c = signed_in_client("dave")
+    f = c.post("/api/files", files=[("files", ("d.png", png()))]).json()[0]
+    r = c.post("/api/ndvi", json={"file_id": f["id"]}).json()
+    storage.rename_user("dave", "Jacob2")
+    assert not os.path.exists(os.path.join(storage.DATA_DIR, "dave"))
+    assert c.get("/api/auth/me").json()["username"] == "Jacob2"  # existing session still valid
+    assert c.get(f"/api/files/{f['id']}/download").content == png()  # same bytes, read from the new folder
+    assert c.get(r["downloads"][0]["url"]).status_code == 200 and c.get(f"/api/results/{r['result']['id']}").status_code == 200
+    assert TestClient(app).post("/api/auth/login", json={"username": "dave", "password": "correct-horse"}).status_code == 401
+    assert TestClient(app).post("/api/auth/login", json={"username": "Jacob2", "password": "correct-horse"}).status_code == 200
